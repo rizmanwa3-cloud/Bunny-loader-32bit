@@ -1,1 +1,125 @@
+name: recon
 
+# Membongkar Bunny Loader v0.4.0 (ARM64) supaya bisa dipetakan untuk port 32-bit.
+# Hasilnya di-upload ke release "recon-output" (file recon-output.zip).
+# Jalankan manual: tab Actions -> recon -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: Bunnyloader32bitproject
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+
+      - name: Unduh APK dari release
+        run: |
+          mkdir -p work/in out
+          cd work/in
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" \
+            -p 'bunny-loader.v0.4.0.apk' -p 'Terraria-1.4.5.8.6.apk'
+          ls -la
+
+      - name: Ekstrak bagian penting Bunny Loader
+        run: |
+          mkdir -p work/bl && cd work/bl
+          unzip -q -o ../in/bunny-loader.v0.4.0.apk \
+            'lib/*' 'assets/dotnet/BunnyLoader.dll' 'classes*.dex' AndroidManifest.xml
+          ls -la lib/arm64-v8a
+
+      - name: Dekompilasi BunnyLoader.dll (ILSpy)
+        continue-on-error: true
+        run: |
+          dotnet tool install -g ilspycmd
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          mkdir -p out/csharp
+          ilspycmd -p -o out/csharp work/bl/assets/dotnet/BunnyLoader.dll
+
+      - name: Dekompilasi kode Kotlin/Java (jadx)
+        continue-on-error: true
+        run: |
+          mkdir -p work/tools/jadx out/jadx
+          gh release download -R skylot/jadx -p 'jadx-[0-9]*.zip' --dir work/tools
+          unzip -q work/tools/jadx-*.zip -d work/tools/jadx
+          work/tools/jadx/bin/jadx -d out/jadx --no-res -j 2 \
+            work/bl/classes4.dex work/bl/classes6.dex work/bl/classes7.dex || true
+
+      - name: Dekompilasi libbunny.so (Ghidra)
+        continue-on-error: true
+        run: |
+          mkdir -p work/tools work/gscripts work/gproj out/ghidra
+          gh release download -R NationalSecurityAgency/ghidra \
+            -p 'ghidra_*_PUBLIC_*.zip' --dir work/tools
+          unzip -q work/tools/ghidra_*.zip -d work/tools
+          GH_HOME="$(ls -d work/tools/ghidra_*_PUBLIC | head -1)"
+          cat > work/gscripts/DumpDecomp.java <<'JAVA'
+          import ghidra.app.script.GhidraScript;
+          import ghidra.app.decompiler.DecompInterface;
+          import ghidra.app.decompiler.DecompileResults;
+          import ghidra.program.model.listing.Function;
+          import ghidra.program.model.listing.FunctionIterator;
+          import java.io.PrintWriter;
+          import java.io.FileWriter;
+
+          public class DumpDecomp extends GhidraScript {
+            @Override
+            public void run() throws Exception {
+              String outPath = getScriptArgs()[0];
+              DecompInterface ifc = new DecompInterface();
+              ifc.openProgram(currentProgram);
+              PrintWriter out = new PrintWriter(new FileWriter(outPath));
+              FunctionIterator it = currentProgram.getFunctionManager().getFunctions(true);
+              int n = 0;
+              while (it.hasNext() && !monitor.isCancelled()) {
+                Function f = it.next();
+                if (f.isThunk() || f.isExternal()) continue;
+                String name = f.getName();
+                if (name.contains("__ndk1") || name.startsWith("_ZNSt") || name.startsWith("_ZNKSt")) continue;
+                if (f.getBody().getNumAddresses() < 12) continue;
+                DecompileResults r = ifc.decompileFunction(f, 30, monitor);
+                if (r != null && r.decompileCompleted()) {
+                  out.println("// ==== " + name + " @ " + f.getEntryPoint() + " ====");
+                  out.println(r.getDecompiledFunction().getC());
+                  out.flush();
+                  n++;
+                }
+              }
+              out.close();
+              println("Decompiled functions: " + n);
+            }
+          }
+          JAVA
+          "$GH_HOME/support/analyzeHeadless" "$PWD/work/gproj" bunny \
+            -import work/bl/lib/arm64-v8a/libbunny.so \
+            -scriptPath "$PWD/work/gscripts" \
+            -postScript DumpDecomp.java "$PWD/out/ghidra/libbunny_decompiled.c" \
+            -analysisTimeoutPerFile 5400 -deleteProject
+          ls -la out/ghidra
+
+      - name: Upload hasil ke release recon-output
+        if: always()
+        run: |
+          cp work/bl/AndroidManifest.xml out/ || true
+          cd out && zip -r -q ../recon-output.zip . && cd ..
+          ls -la recon-output.zip
+          gh release view recon-output -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create recon-output -R "$GITHUB_REPOSITORY" \
+              -t "recon output" -n "Hasil bongkar Bunny Loader (otomatis)"
+          gh release upload recon-output recon-output.zip -R "$GITHUB_REPOSITORY" --clobber
