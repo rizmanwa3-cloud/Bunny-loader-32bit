@@ -1,0 +1,107 @@
+name: build-arm32
+
+# Merakit APK Bunny Loader versi 32-bit (armeabi-v7a) dan mengunggahnya ke release "build-output".
+# Berjalan otomatis setiap ada push ke branch "build-arm32", atau manual lewat Actions -> Run workflow.
+#
+# Tahap 1 (sekarang): game + launcher jalan di 32-bit, TANPA mod (libbunny ARMv7 belum ada).
+# Kalau file prebuilt/armeabi-v7a/libbunny.so ada di repo, otomatis ikut dimasukkan.
+
+on:
+  push:
+    branches: [build-arm32]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-arm32
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  TAG: Bunnyloader32bitproject
+  MONO_VER: "10.0.14"
+  SHADOWHOOK_VER: "1.0.10"
+  GPATH_VER: "1.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unduh APK sumber dari release
+        run: |
+          mkdir -p work/in work/out
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" \
+            -p 'bunny-loader.v0.4.0.apk' -p 'Terraria-1.4.5.8.6.apk' --dir work/in
+          ls -la work/in
+
+      - name: Unduh komponen 32-bit
+        run: |
+          mkdir -p work/dl && cd work/dl
+          NUGET="https://api.nuget.org/v3-flatcontainer/microsoft.netcore.app.runtime.mono.android-arm"
+          VER="$MONO_VER"
+          if ! curl -fsSL --retry 3 -o mono.nupkg "$NUGET/$VER/microsoft.netcore.app.runtime.mono.android-arm.$VER.nupkg"; then
+            echo "::warning::Mono $VER tidak ada di NuGet, memakai 10.0.x terbaru"
+            VER="$(curl -fsSL "$NUGET/index.json" | jq -r '.versions[]' | grep -E '^10\.0\.[0-9]+$' | sort -V | tail -1)"
+            curl -fsSL --retry 3 -o mono.nupkg "$NUGET/$VER/microsoft.netcore.app.runtime.mono.android-arm.$VER.nupkg"
+          fi
+          echo "Mono runtime pack: $VER"
+          curl -fsSL --retry 3 -o shadowhook.aar \
+            "https://repo1.maven.org/maven2/com/bytedance/android/shadowhook/$SHADOWHOOK_VER/shadowhook-$SHADOWHOOK_VER.aar"
+          curl -fsSL --retry 3 -o gpath.aar \
+            "https://dl.google.com/android/maven2/androidx/graphics/graphics-path/$GPATH_VER/graphics-path-$GPATH_VER.aar"
+          mkdir mono shadowhook gpath
+          unzip -q mono.nupkg -d mono
+          unzip -q shadowhook.aar -d shadowhook
+          unzip -q gpath.aar -d gpath
+          echo "--- isi paket mono android-arm"
+          find mono -path '*android-arm/*' -type f | sed 's#^mono/##' | sort | head -120
+          echo "--- shadowhook / graphics-path"
+          find shadowhook gpath -name '*.so' | sort
+
+      - name: Rakit APK 32-bit
+        run: |
+          EXTRA=""
+          if [ -f prebuilt/armeabi-v7a/libbunny.so ]; then
+            EXTRA="--libbunny prebuilt/armeabi-v7a/libbunny.so"
+            echo "libbunny ARMv7 ditemukan, ikut dimasukkan"
+          else
+            echo "libbunny ARMv7 belum ada: mod belum aktif (tahap 1)"
+          fi
+          python3 tools/assemble_arm32.py \
+            --base work/in/bunny-loader.v0.4.0.apk \
+            --terraria work/in/Terraria-1.4.5.8.6.apk \
+            --mono work/dl/mono --shadowhook work/dl/shadowhook --gpath work/dl/gpath \
+            $EXTRA --out work/out/unsigned.apk --report work/out/build-report.txt
+
+      - name: Zipalign dan tanda tangan
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          echo "build-tools: $BT"
+          # Pakai keystore yang sama antar build (supaya bisa update tanpa uninstall).
+          gh release download build-output -R "$GITHUB_REPOSITORY" -p bunny32.keystore --dir work/out 2>/dev/null || true
+          NEWKEY=0
+          if [ ! -f work/out/bunny32.keystore ]; then
+            keytool -genkeypair -keystore work/out/bunny32.keystore -storepass android -keypass android \
+              -alias bunny32 -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Bunny32 personal build"
+            NEWKEY=1
+          fi
+          echo "NEWKEY=$NEWKEY" >> "$GITHUB_ENV"
+          "$BT/zipalign" -p -f 4 work/out/unsigned.apk work/out/aligned.apk
+          "$BT/apksigner" sign --ks work/out/bunny32.keystore --ks-pass pass:android --key-pass pass:android \
+            --ks-key-alias bunny32 --out work/out/bunny-loader.v0.4.0-arm32.apk work/out/aligned.apk
+          "$BT/apksigner" verify --verbose work/out/bunny-loader.v0.4.0-arm32.apk | head -6
+          ls -la work/out
+
+      - name: Upload ke release build-output
+        run: |
+          gh release view build-output -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create build-output -R "$GITHUB_REPOSITORY" \
+              -t "build output" -n "APK 32-bit hasil rakit otomatis (build-arm32)"
+          FILES="work/out/bunny-loader.v0.4.0-arm32.apk work/out/build-report.txt"
+          if [ "$NEWKEY" = "1" ]; then FILES="$FILES work/out/bunny32.keystore"; fi
+          gh release upload build-output $FILES -R "$GITHUB_REPOSITORY" --clobber
