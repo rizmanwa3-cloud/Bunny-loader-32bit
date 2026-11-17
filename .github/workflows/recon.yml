@@ -8,6 +8,8 @@ name: recon
 # Jalankan manual: tab Actions -> recon -> Run workflow.
 
 on:
+  push:
+    branches: [recon-v2]
   workflow_dispatch:
 
 permissions:
@@ -19,7 +21,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Siapkan release recon-output
@@ -30,7 +32,7 @@ jobs:
 
   managed:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/setup-dotnet@v4
@@ -77,7 +79,7 @@ jobs:
 
   native:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - uses: actions/setup-java@v4
