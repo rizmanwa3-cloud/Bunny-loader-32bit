@@ -1,0 +1,67 @@
+name: verify-apk
+
+# Diagnosis APK 32-bit: kenapa HP bilang "Ada masalah saat mengurai paket".
+# Jalan otomatis saat push ke branch verify-apk, atau manual.
+on:
+  push:
+    branches: [verify-apk]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  APK: bunny-loader.v0.4.0-arm32.apk
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Unduh APK
+        run: |
+          mkdir -p w && cd w
+          gh release download build-output -R "$GITHUB_REPOSITORY" -p "$APK"
+          ls -la
+      - name: Verifikasi tanda tangan + manifest
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          cd w
+          echo "=== apksigner verify ==="
+          "$BT/apksigner" verify --verbose --print-certs "$APK" || true
+          echo "=== aapt2 dump badging ==="
+          "$BT/aapt2" dump badging "$APK" 2>&1 | head -60 || true
+          echo "=== zipalign check ==="
+          "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -5 || true
+          "$BT/zipalign" -c 4 "$APK" && echo "zipalign OK" || echo "zipalign GAGAL"
+          echo "=== zip -T ==="
+          unzip -tqq "$APK" | tail -3 || true
+          echo "=== jarsigner ==="
+          jarsigner -verify "$APK" 2>&1 | tail -5 || true
+
+  emulator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - name: Unduh APK
+        run: |
+          mkdir -p w && cd w
+          gh release download build-output -R "$GITHUB_REPOSITORY" -p "$APK"
+      - name: Aktifkan KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - name: Coba install di emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          script: |
+            adb logcat -c
+            adb install -r w/bunny-loader.v0.4.0-arm32.apk 2>&1 | tee install.txt || true
+            echo "=== logcat (PackageManager/parse) ==="
+            adb logcat -d | grep -iE "PackageManager|PackageParser|ParsingPackage|parse|INSTALL_" | tail -40 || true
