@@ -1,0 +1,55 @@
+name: diag-variants
+
+# Membuat 2 APK diagnosis dari APK 32-bit untuk mencari penyebab "gagal mengurai paket":
+#   diag-slim.apk   = tanpa libil2cpp/libunity (cek apakah ukuran/jumlah isi jadi masalah)
+#   diag-v1v2.apk   = isi penuh, tanda tangan v1+v2 saja (tanpa v3)
+# Hasil masuk ke release "diag-output".
+on:
+  push:
+    branches: [verify-apk]
+    paths: ['.github/workflows/diag-variants.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Unduh APK + keystore
+        run: |
+          mkdir -p w && cd w
+          gh release download build-output -R "$GITHUB_REPOSITORY" -p bunny-loader.v0.4.0-arm32.apk -p bunny32.keystore
+          ls -la
+      - name: Buat varian
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          cd w
+          strip_sig() { zip -q -d "$1" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/MANIFEST.MF' || true; }
+          sign() { # in out extra...
+            in=$1; out=$2; shift 2
+            "$BT/zipalign" -p -f 4 "$in" "al-$in"
+            "$BT/apksigner" sign --ks bunny32.keystore --ks-pass pass:android --key-pass pass:android \
+              --ks-key-alias bunny32 "$@" --out "$out" "al-$in"
+            "$BT/apksigner" verify --verbose "$out" | head -5
+          }
+          # varian 1: ramping
+          cp bunny-loader.v0.4.0-arm32.apk slim.apk
+          strip_sig slim.apk
+          zip -q -d slim.apk lib/armeabi-v7a/libil2cpp.so lib/armeabi-v7a/libunity.so
+          sign slim.apk diag-slim.apk
+          # varian 2: v1+v2 saja
+          cp bunny-loader.v0.4.0-arm32.apk full.apk
+          strip_sig full.apk
+          sign full.apk diag-v1v2.apk --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled false --min-sdk-version 21
+          ls -la diag-*.apk
+      - name: Unggah
+        run: |
+          gh release view diag-output -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create diag-output -R "$GITHUB_REPOSITORY" -t "diag output" -n "APK diagnosis (otomatis)"
+          gh release upload diag-output w/diag-slim.apk w/diag-v1v2.apk -R "$GITHUB_REPOSITORY" --clobber
